@@ -5,3 +5,6 @@ pillow
 pyperclip
 pytesseract
 openai
+openwakeword
+sounddevice
+faster-whisper
