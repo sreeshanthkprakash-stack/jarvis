@@ -1,7 +1,7 @@
-groq
 python-dotenv
 pywin32
 pyautogui
 pillow
 pyperclip
 pytesseract
+openai

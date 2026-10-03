@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "groq>=1.7.0",
+    "openai>=3.24.0",
     "pillow>=12.3.0",
     "pyautogui>=0.9.54",
     "pyperclip>=1.11.0",

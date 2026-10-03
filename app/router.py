@@ -109,9 +109,6 @@ class JarvisRouter:
         # AI INTENT ENGINE
         # --------------------------------------------------------
 
-        if self.is_local_computer_command(user_input):
-            return self.execute_local_computer_command(user_input)
-
         decision = self.brain.understand(
             user_input
         )
@@ -151,9 +148,20 @@ class JarvisRouter:
         # REGISTERED TOOL
         # --------------------------------------------------------
 
-        return self.execute(
-            action,
-            arguments,
+        if action:
+            return self.execute(
+                action,
+                arguments,
+            )
+
+        # --------------------------------------------------------
+        # LLM FALLBACK
+        # --------------------------------------------------------
+        # If the intent model did not produce a usable tool action,
+        # let the local Qwen model answer the user normally.
+
+        return self.brain.ask(
+            user_input
         )
 
     # ============================================================
@@ -1487,6 +1495,40 @@ class JarvisRouter:
                     "url": search_url,
                 },
             )
+
+        # --------------------------------------------------------
+        # SEARCH / OPEN SOMETHING ON GOOGLE
+        # --------------------------------------------------------
+        # Examples:
+        #   open wikipedia on google
+        #   open youtube on google
+        #   search AI agents on google
+        #
+        # These are web-search requests, not application names.
+
+        google_match = re.match(
+            r"^(?:open|search)\s+(.+?)\s+(?:on|in)\s+google$",
+            user_input.strip(),
+            re.IGNORECASE,
+        )
+
+        if google_match:
+
+            query = google_match.group(1).strip()
+
+            if query:
+
+                search_url = (
+                    "https://www.google.com/search?q="
+                    + quote_plus(query)
+                )
+
+                return (
+                    "open_url",
+                    {
+                        "url": search_url,
+                    },
+                )
 
         # --------------------------------------------------------
         # URL / WEBSITE

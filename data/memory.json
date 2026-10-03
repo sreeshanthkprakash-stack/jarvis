@@ -1,7 +1,8 @@
 {
     "facts": {
         "preferred_programming_language": "Python",
-        "favorite language": "Python"
+        "favorite language": "Python",
+        "name": "sreeshanth"
     },
     "preferences": {},
     "notes": []

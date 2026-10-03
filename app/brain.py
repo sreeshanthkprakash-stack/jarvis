@@ -1,51 +1,56 @@
-
 import json
 
+# pyrefly: ignore [missing-import]
+from openai import OpenAI
 
 # pyrefly: ignore [missing-import]
-from groq import Groq
-
+from app.config import (
+    MODEL,
+    MODEL_API_KEY,
+    MODEL_BASE_URL,
+    MODEL_TEMPERATURE,
+    MODEL_MAX_TOKENS,
+)
 
 # pyrefly: ignore [missing-import]
-from app.config import GROQ_API_KEY, MODEL
-
-
-# pyrefly: ignore [missing-import]
-from app.memory import ConversationMemory, PersistentMemory
+from app.memory import (
+    ConversationMemory,
+    PersistentMemory,
+)
 
 
 class JarvisBrain:
 
     def __init__(self, system_prompt, tool_registry=None):
 
-        if not GROQ_API_KEY:
-            raise RuntimeError(
-                "GROQ_API_KEY is missing from your .env file."
-            )
+        # ======================================================
+        # LOCAL DOCKER MODEL RUNNER CLIENT
+        # ======================================================
 
-        self.client = Groq(
-            api_key=GROQ_API_KEY
+        self.client = OpenAI(
+            base_url=MODEL_BASE_URL,
+            api_key=MODEL_API_KEY,
         )
 
-        # ------------------------------------------------------
-        # Short-term conversation memory
-        # ------------------------------------------------------
+        # ======================================================
+        # SHORT-TERM CONVERSATION MEMORY
+        # ======================================================
 
         self.memory = ConversationMemory(
             system_prompt
         )
 
-        # ------------------------------------------------------
-        # Long-term persistent memory
-        # ------------------------------------------------------
+        # ======================================================
+        # LONG-TERM PERSISTENT MEMORY
+        # ======================================================
 
         self.persistent_memory = PersistentMemory()
 
         self.system_prompt = system_prompt
 
-        # ------------------------------------------------------
-        # Tool registry
-        # ------------------------------------------------------
+        # ======================================================
+        # TOOL REGISTRY
+        # ======================================================
 
         self.tool_registry = tool_registry
 
@@ -54,6 +59,7 @@ class JarvisBrain:
     # ==========================================================
 
     def set_tool_registry(self, tool_registry):
+
         self.tool_registry = tool_registry
 
     def get_tool_descriptions(self):
@@ -84,20 +90,61 @@ class JarvisBrain:
         )
 
     # ==========================================================
+    # SAFE JSON RESPONSE
+    # ==========================================================
+
+    def _parse_json_response(self, content):
+
+        if not content:
+            raise ValueError(
+                "The local model returned an empty response."
+            )
+
+        content = content.strip()
+
+        # ------------------------------------------------------
+        # Remove markdown code fences if model adds them
+        # ------------------------------------------------------
+
+        if content.startswith("```"):
+
+            lines = content.splitlines()
+
+            if lines:
+                lines = lines[1:]
+
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+
+            content = "\n".join(lines).strip()
+
+        # ------------------------------------------------------
+        # Remove accidental <think> blocks
+        # ------------------------------------------------------
+
+        if "<think>" in content:
+
+            end = content.find("</think>")
+
+            if end != -1:
+                content = (
+                    content[end + len("</think>"):]
+                    .strip()
+                )
+
+        # ------------------------------------------------------
+        # Parse JSON
+        # ------------------------------------------------------
+
+        return json.loads(content)
+
+    # ==========================================================
     # MEMORY EXTRACTION
-    #
-    # Kept available, but NOT automatically called during
-    # normal AI conversations.
     # ==========================================================
 
     def extract_memory(self, user_input):
 
-        response = self.client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
+        memory_prompt = """
 You are JARVIS's long-term memory extraction system.
 
 Analyze the user's message and determine whether it contains
@@ -145,16 +192,6 @@ Result:
 }
 
 User:
-"I live in Delhi"
-
-Result:
-{
-    "should_remember": true,
-    "key": "location",
-    "value": "Delhi"
-}
-
-User:
 "I like dark mode"
 
 Result:
@@ -174,59 +211,52 @@ Result:
     "value": ""
 }
 
-User:
-"Explain quantum physics"
+Return ONLY valid JSON.
+Do not use markdown.
+Do not explain anything.
+"""
 
-Result:
-{
-    "should_remember": false,
-    "key": "",
-    "value": ""
-}
-
-Return JSON only.
-""",
+        response = self.client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": memory_prompt,
                 },
                 {
                     "role": "user",
-                    "content": user_input,
+                    "content": (
+                        "/no_think\n"
+                        + user_input
+                    ),
                 },
             ],
             temperature=0,
+            max_tokens=128,
             response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "memory_extraction",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "should_remember": {
-                                "type": "boolean"
-                            },
-                            "key": {
-                                "type": "string"
-                            },
-                            "value": {
-                                "type": "string"
-                            },
-                        },
-                        "required": [
-                            "should_remember",
-                            "key",
-                            "value",
-                        ],
-                        "additionalProperties": False,
-                    },
-                },
+                "type": "json_object"
             },
         )
 
-        content = response.choices[0].message.content
+        content = (
+            response
+            .choices[0]
+            .message
+            .content
+        )
 
-        return json.loads(content)
+        return self._parse_json_response(
+            content
+        )
 
-    def update_memory_from_message(self, user_input):
+    # ==========================================================
+    # UPDATE MEMORY
+    # ==========================================================
+
+    def update_memory_from_message(
+        self,
+        user_input,
+    ):
 
         try:
 
@@ -241,12 +271,12 @@ Return JSON only.
 
             key = result.get(
                 "key",
-                ""
+                "",
             ).strip()
 
             value = result.get(
                 "value",
-                ""
+                "",
             ).strip()
 
             if key and value:
@@ -268,74 +298,141 @@ Return JSON only.
 
     def ask(self, user_input):
 
+        # ------------------------------------------------------
         # Add user message to short-term memory
+        # ------------------------------------------------------
+
         self.memory.add_user(
             user_input
         )
 
-        # Do NOT automatically extract memory here.
-        #
-        # Memory is handled through the memory tools.
+        # ------------------------------------------------------
+        # Get conversation history
+        # ------------------------------------------------------
 
-        messages = self.memory.get_messages().copy()
+        messages = (
+            self.memory
+            .get_messages()
+            .copy()
+        )
 
-        # Inject persistent memory into system prompt
-        messages[0] = {
-            "role": "system",
-            "content": (
-                self.system_prompt
-                + self.get_memory_context()
-            ),
-        }
+        # ------------------------------------------------------
+        # Inject persistent memory
+        # ------------------------------------------------------
 
-        # Generate AI response
-        stream = self.client.chat.completions.create(
+        if messages:
+
+            messages[0] = {
+                "role": "system",
+                "content": (
+                    self.system_prompt
+                    + self.get_memory_context()
+                ),
+            }
+
+        else:
+
+            messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": (
+                        self.system_prompt
+                        + self.get_memory_context()
+                    ),
+                },
+            )
+
+        # ------------------------------------------------------
+        # Add /no_think to current user message
+        # ------------------------------------------------------
+
+        if messages:
+
+            # Find the latest user message.
+            for index in range(
+                len(messages) - 1,
+                -1,
+                -1,
+            ):
+
+                if messages[index].get(
+                    "role"
+                ) == "user":
+
+                    messages[index] = {
+                        "role": "user",
+                        "content": (
+                            "/no_think\n"
+                            + str(
+                                messages[index].get(
+                                    "content",
+                                    "",
+                                )
+                            )
+                        ),
+                    }
+
+                    break
+
+        # ------------------------------------------------------
+        # Generate response
+        # ------------------------------------------------------
+
+        response = self.client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            temperature=0.7,
-            stream=True,
+            temperature=MODEL_TEMPERATURE,
+            max_tokens=MODEL_MAX_TOKENS,
+            stream=False,
         )
 
-        full_response = ""
+        content = (
+            response
+            .choices[0]
+            .message
+            .content
+        )
 
-        for chunk in stream:
+        if not content:
 
-            if not chunk.choices:
-                continue
+            content = (
+                "I couldn't generate a response."
+            )
 
-            text = chunk.choices[0].delta.content
+        # ------------------------------------------------------
+        # Clean accidental reasoning
+        # ------------------------------------------------------
 
-            if text:
+        content = content.strip()
 
-                print(
-                    text,
-                    end="",
-                    flush=True,
+        if "<think>" in content:
+
+            end = content.find(
+                "</think>"
+            )
+
+            if end != -1:
+
+                content = (
+                    content[
+                        end + len("</think>"):
+                    ]
+                    .strip()
                 )
 
-                full_response += text
-
-        print()
-
+        # ------------------------------------------------------
         # Save assistant response
+        # ------------------------------------------------------
+
         self.memory.add_assistant(
-            full_response
+            content
         )
 
-        return None
+        return content
 
     # ==========================================================
-    # GROQ INTENT RESPONSE SCHEMA
-    #
-    # Groq requires the TOP LEVEL to be an object.
-    #
-    # {
-    #     "action": "...",
-    #     "arguments": "...",
-    #     "response": "..."
-    # }
-    #
-    # arguments is a JSON STRING containing the actual arguments.
+    # INTENT RESPONSE SCHEMA
     # ==========================================================
 
     def build_intent_schema(self):
@@ -368,7 +465,8 @@ Return JSON only.
     def understand(self, user_input):
 
         recent_messages = (
-            self.memory.get_messages()[-6:]
+            self.memory
+            .get_messages()[-6:]
         )
 
         tool_descriptions = (
@@ -408,23 +506,14 @@ Return JSON only.
         )
 
         # ------------------------------------------------------
-        # Intent prompt
+        # Intent system prompt
         # ------------------------------------------------------
 
-        messages = [
-            {
-                "role": "system",
-                "content": f"""
+        intent_prompt = f"""
 You are JARVIS's intent engine.
 
 Your job is to understand the user's request and select
 the correct local capability.
-
-Most simple requests use one local tool.
-
-If a request requires multiple computer operations,
-use the "run_actions" tool to compose multiple existing
-tools into one ordered sequence.
 
 Available local capabilities:
 
@@ -472,7 +561,7 @@ Rules:
 
 10. Do not answer the user's question yourself.
 
-11. Return JSON only.
+11. Return ONLY valid JSON.
 
 12. Use "run_actions" when the user's request requires
     multiple local actions.
@@ -490,25 +579,11 @@ Rules:
 17. Do not use AI_QUERY when the user's request can be
     performed by the available local computer tools.
 
-18. For computer automation, prefer the existing local
-    primitives such as:
-
-    open_application
-    close_application
-    open_url
-    open_website
-    type_text
-    press_key
-    hotkey
-    move_mouse
-    click_mouse
-    wait
-    get_screen_size
-    take_screen_capture
+18. For computer automation, prefer existing local tools.
 
 19. "run_actions" must contain an "actions" array.
 
-20. Each item in the "actions" array must have this form:
+20. Each item in "actions" must have this form:
 
 {{
     "action": "existing_tool_name",
@@ -526,53 +601,44 @@ Rules:
     provides an actual URL or domain.
 
 25. When interacting with a browser after opening it,
-    use keyboard and mouse primitives rather than inventing
-    browser-specific tools.
+    use keyboard and mouse primitives.
 
 Examples:
 
 User:
-
 "open vs code"
 
 Return:
-
 {{
     "action": "open_application",
-    "arguments": "{{\\\\"application\\\\": \\\\"vs code\\\\"}}",
+    "arguments": "{{\\"application\\": \\"vs code\\"}}",
     "response": ""
 }}
 
 User:
-
 "copy hello world"
 
 Return:
-
 {{
     "action": "set_clipboard",
-    "arguments": "{{\\\\"text\\\\": \\\\"hello world\\\\"}}",
+    "arguments": "{{\\"text\\": \\"hello world\\"}}",
     "response": ""
 }}
 
 User:
-
 "remember that my name is Alex"
 
 Return:
-
 {{
     "action": "remember_fact",
-    "arguments": "{{\\\\"key\\\\": \\\\"name\\\\", \\\\"value\\\\": \\\\"Alex\\\\"}}",
+    "arguments": "{{\\"key\\": \\"name\\", \\"value\\": \\"Alex\\"}}",
     "response": ""
 }}
 
 User:
-
 "what is quantum physics?"
 
 Return:
-
 {{
     "action": "AI_QUERY",
     "arguments": "{{}}",
@@ -580,74 +646,88 @@ Return:
 }}
 
 User:
-
 "open Chrome and go to google.com"
 
 Return:
-
 {{
     "action": "run_actions",
-    "arguments": "{{\\\\"actions\\\\":[{{\\\\"action\\\\":\\\\"open_application\\\\",\\\\"arguments\\\\":{{\\\\"application\\\\":\\\\"Chrome\\\\"}}}},{{\\\\"action\\\\":\\\\"wait\\\\",\\\\"arguments\\\\":{{\\\\"seconds\\\\":2}}}},{{\\\\"action\\\\":\\\\"hotkey\\\\",\\\\"arguments\\\\":{{\\\\"keys\\\\":\\\\"ctrl+l\\\\"}}}},{{\\\\"action\\\\":\\\\"type_text\\\\",\\\\"arguments\\\\":{{\\\\"text\\\\":\\\\"https://google.com\\\\"}}}},{{\\\\"action\\\\":\\\\"press_key\\\\",\\\\"arguments\\\\":{{\\\\"key\\\\":\\\\"enter\\\\"}}}}]}}",
+    "arguments": "{{\\"actions\\":[{{\\"action\\":\\"open_application\\",\\"arguments\\":{{\\"application\\":\\"Chrome\\"}}}},{{\\"action\\":\\"wait\\",\\"arguments\\":{{\\"seconds\\":2}}}},{{\\"action\\":\\"hotkey\\",\\"arguments\\":{{\\"keys\\":\\"ctrl+l\\"}}}},{{\\"action\\":\\"type_text\\",\\"arguments\\":{{\\"text\\":\\"https://google.com\\"}}}},{{\\"action\\":\\"press_key\\",\\"arguments\\":{{\\"key\\":\\"enter\\"}}}}]}}",
     "response": ""
 }}
 
 User:
-
 "open Notepad and type hello JARVIS"
 
 Return:
-
 {{
     "action": "run_actions",
-    "arguments": "{{\\\\"actions\\\\":[{{\\\\"action\\\\":\\\\"open_application\\\\",\\\\"arguments\\\\":{{\\\\"application\\\\":\\\\"Notepad\\\\"}}}},{{\\\\"action\\\\":\\\\"wait\\\\",\\\\"arguments\\\\":{{\\\\"seconds\\\\":2}}}},{{\\\\"action\\\\":\\\\"type_text\\\\",\\\\"arguments\\\\":{{\\\\"text\\\\":\\\\"hello JARVIS\\\\"}}}}]}}",
+    "arguments": "{{\\"actions\\":[{{\\"action\\":\\"open_application\\",\\"arguments\\":{{\\"application\\":\\"Notepad\\"}}}},{{\\"action\\":\\"wait\\",\\"arguments\\":{{\\"seconds\\":2}}}},{{\\"action\\":\\"type_text\\",\\"arguments\\":{{\\"text\\":\\"hello JARVIS\\"}}}}]}}",
     "response": ""
 }}
-""",
+"""
+
+        # ------------------------------------------------------
+        # Build messages
+        # ------------------------------------------------------
+
+        messages = [
+            {
+                "role": "system",
+                "content": intent_prompt,
             }
         ]
 
         # ------------------------------------------------------
-        # Conversation context
+        # Add recent conversation
         # ------------------------------------------------------
 
-        messages.extend(
-            recent_messages
-        )
+        for message in recent_messages:
+
+            role = message.get(
+                "role"
+            )
+
+            content = message.get(
+                "content"
+            )
+
+            if role in {
+                "user",
+                "assistant",
+            }:
+
+                messages.append(
+                    {
+                        "role": role,
+                        "content": content,
+                    }
+                )
 
         # ------------------------------------------------------
-        # Current user request
+        # Current request
         # ------------------------------------------------------
 
         messages.append(
             {
                 "role": "user",
-                "content": user_input,
+                "content": (
+                    "/no_think\n"
+                    + user_input
+                ),
             }
         )
 
         # ------------------------------------------------------
-        # Dynamic schema
-        # ------------------------------------------------------
-
-        intent_schema = (
-            self.build_intent_schema()
-        )
-
-        # ------------------------------------------------------
-        # Groq structured output
+        # Ask local model
         # ------------------------------------------------------
 
         response = self.client.chat.completions.create(
             model=MODEL,
             messages=messages,
             temperature=0,
+            max_tokens=256,
             response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "jarvis_intent",
-                    "strict": True,
-                    "schema": intent_schema,
-                },
+                "type": "json_object"
             },
         )
 
@@ -658,12 +738,26 @@ Return:
             .content
         )
 
-        result = json.loads(
-            content
-        )
+        # ------------------------------------------------------
+        # Parse JSON
+        # ------------------------------------------------------
+
+        try:
+
+            result = self._parse_json_response(
+                content
+            )
+
+        except Exception:
+
+            return {
+                "action": "AI_QUERY",
+                "arguments": {},
+                "response": "",
+            }
 
         # ------------------------------------------------------
-        # Validate action
+        # Validate result
         # ------------------------------------------------------
 
         valid_actions = set(
@@ -699,6 +793,7 @@ Return:
             raw_arguments,
             str,
         ):
+
             raw_arguments = "{}"
 
         try:
@@ -707,7 +802,7 @@ Return:
                 raw_arguments
             )
 
-        except json.JSONDecodeError:
+        except Exception:
 
             arguments = {}
 
@@ -715,10 +810,11 @@ Return:
             arguments,
             dict,
         ):
+
             arguments = {}
 
         # ------------------------------------------------------
-        # Additional validation for run_actions
+        # Validate run_actions
         # ------------------------------------------------------
 
         if action == "run_actions":
@@ -778,8 +874,7 @@ Return:
                         "response": "",
                     }
 
-                # AI_QUERY cannot be executed as part of
-                # a local computer sequence.
+                # AI_QUERY cannot run inside automation.
                 if nested_action == "AI_QUERY":
 
                     return {
