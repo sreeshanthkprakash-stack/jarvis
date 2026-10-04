@@ -8,3 +8,4 @@ openai
 openwakeword
 sounddevice
 faster-whisper
+pyttsx3

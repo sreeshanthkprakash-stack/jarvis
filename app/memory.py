@@ -2,6 +2,22 @@ import json
 import os
 
 
+# Longest message kept in conversation memory. Tool results (screen
+# text, clipboard, file contents...) can be huge; the user still sees
+# them in full, but only this much is re-sent to the model later.
+MAX_MESSAGE_CHARS = 1200
+
+
+def _clip(message):
+
+    message = str(message)
+
+    if len(message) <= MAX_MESSAGE_CHARS:
+        return message
+
+    return message[:MAX_MESSAGE_CHARS].rstrip() + " ...[truncated]"
+
+
 class ConversationMemory:
     def __init__(self, system_prompt):
         self.messages = [
@@ -15,7 +31,7 @@ class ConversationMemory:
         self.messages.append(
             {
                 "role": "user",
-                "content": message
+                "content": _clip(message)
             }
         )
 
@@ -23,7 +39,7 @@ class ConversationMemory:
         self.messages.append(
             {
                 "role": "assistant",
-                "content": message
+                "content": _clip(message)
             }
         )
 

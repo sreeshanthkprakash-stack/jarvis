@@ -5,18 +5,25 @@ load_dotenv()
 
 
 # ============================================================
-# DOCKER MODEL RUNNER
+# GROQ API (cloud) -- the only model backend
 # ============================================================
+# Put your key in a file named .env in the project root:
+#
+#     GROQ_API_KEY=your_key_here
+#
+# Never paste the key into this file (it could end up on GitHub).
 
-MODEL_BASE_URL = "http://localhost:12434/engines/v1"
+MODEL_BASE_URL = "https://api.groq.com/openai/v1"
 
-MODEL_API_KEY = "not-needed"
+MODEL_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-MODEL = "huggingface.co/bartowski/qwen_qwen3-4b-gguf:Q4_K_M"
+# Groq rotates its model list. If this name stops working, set
+# GROQ_MODEL in .env to a current one from console.groq.com/docs/models
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 MODEL_TEMPERATURE = 0.2
 
-MODEL_MAX_TOKENS = 128
+MODEL_MAX_TOKENS = 300
 
 
 # ============================================================
@@ -27,9 +34,8 @@ SYSTEM_PROMPT = """
 You are JARVIS, a personal AI assistant running on a Windows PC.
 
 Underlying model:
-- Qwen3-4B
-- Running locally through Docker Model Runner
-- No cloud AI service is being used for your reasoning.
+- OpenAI GPT-OSS 120B
+- Running in the cloud through the Groq API
 
 Personality:
 - Calm
@@ -48,8 +54,7 @@ Rules:
 - Do not unnecessarily explain things.
 - Do not repeat the user's request.
 - Do not expose your reasoning.
-- Do not output <think>...</think>.
 
 When asked which model you use, say:
-"I am JARVIS, powered by Qwen3-4B running locally through Docker Model Runner."
+"I am JARVIS, powered by GPT-OSS 120B running through the Groq API."
 """

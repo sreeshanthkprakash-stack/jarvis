@@ -3,93 +3,104 @@ from app.voice.wake_word import WakeWordDetector
 # pyrefly: ignore [missing-import]
 from app.voice.speech_to_text import SpeechToText
 # pyrefly: ignore [missing-import]
-from app.router import JarvisRouter
+from app.voice.text_to_speech import TextToSpeech
+
 # pyrefly: ignore [missing-import]
 from app.brain import JarvisBrain
 # pyrefly: ignore [missing-import]
 from app.config import SYSTEM_PROMPT
+# pyrefly: ignore [missing-import]
+from app.router import JarvisRouter
 
 
 def main():
-    print("Starting JARVIS...")
 
-    # --------------------------------------------------------
-    # INITIALIZE BRAIN
-    # --------------------------------------------------------
+    print("=" * 50)
+    print("        JARVIS VOICE SYSTEM")
+    print("=" * 50)
 
     brain = JarvisBrain(
         SYSTEM_PROMPT
     )
 
-    # --------------------------------------------------------
-    # INITIALIZE ROUTER
-    # --------------------------------------------------------
-
     router = JarvisRouter(
         brain
     )
 
-    # --------------------------------------------------------
-    # INITIALIZE VOICE
-    # --------------------------------------------------------
-
     wake_word = WakeWordDetector()
     stt = SpeechToText()
+    tts = TextToSpeech()
 
     print()
-    print("=" * 50)
-    print("        JARVIS VOICE SYSTEM")
-    print("=" * 50)
+    print("JARVIS voice system ready.")
     print("Say: Hey Jarvis")
     print("Say 'exit' to stop.")
     print("=" * 50)
 
-    # --------------------------------------------------------
-    # VOICE LOOP
-    # --------------------------------------------------------
-
     while True:
 
-        # Wait for wake word
+        # ----------------------------------------------------
+        # WAIT FOR WAKE WORD
+        # ----------------------------------------------------
+
         wake_word.listen()
 
-        print("JARVIS: Yes?")
+        print("\nJARVIS: Yes?")
 
-        # Listen for command
+        # Don't speak Yes? yet.
+        # We first want to make sure the command is captured.
+
+        # ----------------------------------------------------
+        # SPEECH TO TEXT
+        # ----------------------------------------------------
+
         command = stt.listen_and_transcribe(
             seconds=5
         )
 
         if not command:
             print("JARVIS: I didn't hear a command.")
+            tts.speak("I didn't hear a command.")
             continue
 
         print(f"You: {command}")
 
-        # Exit
+        # ----------------------------------------------------
+        # EXIT
+        # ----------------------------------------------------
+
         if command.lower() in {
             "exit",
             "quit",
             "stop",
             "shutdown",
         }:
-            print("JARVIS: Shutting down.")
+            tts.speak("Shutting down.")
             break
 
-        # Send command through existing router
+        # ----------------------------------------------------
+        # ROUTER
+        # ----------------------------------------------------
+
         print("JARVIS: ", end="", flush=True)
 
-        response = router.handle(
-            command
-        )
+        response = router.handle(command)
 
-        if response:
-            print(response)
+        # ----------------------------------------------------
+        # SPEAK RESPONSE
+        # ----------------------------------------------------
+
+        if isinstance(response, str) and response.strip():
+
+            tts.speak(
+                response.strip()
+            )
 
         print()
 
 
 if __name__ == "__main__":
+
     try:
         main()
 
