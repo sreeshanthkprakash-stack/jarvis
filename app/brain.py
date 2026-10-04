@@ -1,4 +1,5 @@
 import json
+import re
 
 # pyrefly: ignore [missing-import]
 from openai import OpenAI
@@ -17,6 +18,37 @@ from app.memory import (
     ConversationMemory,
     PersistentMemory,
 )
+
+# pyrefly: ignore [missing-import]
+from app import config as _config
+
+# ============================================================
+# SPEED TUNABLES
+# Override any of these in app/config.py if you want to.
+# ============================================================
+
+# Messages (not turns) sent to the model in normal chat.
+HISTORY_MESSAGES = getattr(_config, "HISTORY_MESSAGES", 12)
+
+# Messages kept in RAM in total (older ones are dropped).
+STORED_MESSAGES_CAP = getattr(_config, "STORED_MESSAGES_CAP", 40)
+
+# Print the reply token-by-token as it is generated.
+STREAM_REPLIES = getattr(_config, "STREAM_REPLIES", True)
+
+# Max long-term memory items injected into one chat prompt.
+MEMORY_MAX_ITEMS = getattr(_config, "MEMORY_MAX_ITEMS", 8)
+
+# Facts that are always worth including when memory is large.
+ALWAYS_INCLUDE_KEYS = {"name", "user_name", "preferred_name"}
+
+_STOPWORDS = {
+    "the", "and", "for", "are", "but", "not", "you", "your", "with",
+    "this", "that", "what", "how", "can", "please", "jarvis", "have",
+    "has", "was", "were", "will", "would", "could", "should", "about",
+    "from", "into", "than", "then", "them", "they", "their", "there",
+    "when", "where", "which", "who", "why", "tell", "give", "show",
+}
 
 
 class JarvisBrain:
@@ -80,13 +112,123 @@ class JarvisBrain:
     # PERSISTENT MEMORY CONTEXT
     # ==========================================================
 
-    def get_memory_context(self):
+    @staticmethod
+    def _words(text):
+
+        words = set()
+
+        for word in re.findall(r"[a-z0-9]+", str(text).lower()):
+
+            if len(word) <= 2 or word in _STOPWORDS:
+                continue
+
+            # Very light plural handling: "shortcuts" ~ "shortcut".
+            if len(word) > 3 and word.endswith("s"):
+                word = word[:-1]
+
+            words.add(word)
+
+        return words
+
+    def _select_relevant_memory(self, data, query):
+
+        facts = data.get("facts", {}) or {}
+        preferences = data.get("preferences", {}) or {}
+        notes = data.get("notes", []) or []
+
+        items = []
+
+        for key, value in facts.items():
+            items.append(("facts", key, value))
+
+        for key, value in preferences.items():
+            items.append(("preferences", key, value))
+
+        for note in notes:
+            items.append(("notes", None, note))
+
+        # Small memory: just send everything (same as before).
+        if len(items) <= MEMORY_MAX_ITEMS:
+            chosen = items
+
+        else:
+
+            query_words = self._words(query)
+
+            scored = []
+
+            for index, (section, key, value) in enumerate(items):
+
+                text = f"{key or ''} {value}"
+
+                score = len(query_words & self._words(text))
+
+                if key in ALWAYS_INCLUDE_KEYS:
+                    score += 100
+
+                if score > 0:
+                    scored.append((score, index))
+
+            # Best score first; for ties prefer the newest item.
+            scored.sort(key=lambda pair: (-pair[0], -pair[1]))
+
+            keep = {
+                index for _, index
+                in scored[:MEMORY_MAX_ITEMS]
+            }
+
+            chosen = [
+                item for index, item in enumerate(items)
+                if index in keep
+            ]
+
+        selected = {
+            "facts": {},
+            "preferences": {},
+            "notes": [],
+        }
+
+        for section, key, value in chosen:
+
+            value = str(value)
+
+            if len(value) > 200:
+                value = value[:200] + "..."
+
+            if section == "notes":
+                selected["notes"].append(value)
+            else:
+                selected[section][key] = value
+
+        return selected
+
+    def get_memory_context(self, query=None):
 
         memory_data = self.persistent_memory.get_all()
 
+        # No query -> old behaviour (everything).
+        if query is None:
+            selected = memory_data
+
+        else:
+            selected = self._select_relevant_memory(
+                memory_data,
+                query,
+            )
+
+        if not (
+            selected.get("facts")
+            or selected.get("preferences")
+            or selected.get("notes")
+        ):
+            return ""
+
         return (
-            "\n\nJARVIS MEMORY:\n"
-            f"{json.dumps(memory_data, indent=2, ensure_ascii=False)}"
+            "\n\nJARVIS MEMORY (use only if relevant):\n"
+            + json.dumps(
+                selected,
+                ensure_ascii=False,
+            )
         )
 
     # ==========================================================
@@ -296,6 +438,31 @@ Do not explain anything.
     # NORMAL AI CONVERSATION
     # ==========================================================
 
+    def _cap_stored_history(self):
+
+        messages = self.memory.messages
+
+        if len(messages) > STORED_MESSAGES_CAP + 1:
+
+            self.memory.messages = (
+                [messages[0]]
+                + messages[-STORED_MESSAGES_CAP:]
+            )
+
+    @staticmethod
+    def _strip_think(content):
+
+        content = (content or "").strip()
+
+        if "<think>" in content:
+
+            end = content.find("</think>")
+
+            if end != -1:
+                content = content[end + len("</think>"):].strip()
+
+        return content
+
     def ask(self, user_input):
 
         # ------------------------------------------------------
@@ -306,78 +473,63 @@ Do not explain anything.
             user_input
         )
 
+        self._cap_stored_history()
+
         # ------------------------------------------------------
-        # Get conversation history
+        # System prompt + only the memory that matters now
         # ------------------------------------------------------
 
-        messages = (
-            self.memory
-            .get_messages()
-            .copy()
+        system_content = (
+            self.system_prompt
+            + self.get_memory_context(user_input)
         )
 
         # ------------------------------------------------------
-        # Inject persistent memory
+        # Only the most recent messages go to the model
         # ------------------------------------------------------
 
-        if messages:
+        history = [
+            dict(message)
+            for message in self.memory.get_messages()
+            if message.get("role") != "system"
+        ][-HISTORY_MESSAGES:]
 
-            messages[0] = {
+        messages = [
+            {
                 "role": "system",
-                "content": (
-                    self.system_prompt
-                    + self.get_memory_context()
-                ),
+                "content": system_content,
             }
-
-        else:
-
-            messages.insert(
-                0,
-                {
-                    "role": "system",
-                    "content": (
-                        self.system_prompt
-                        + self.get_memory_context()
-                    ),
-                },
-            )
+        ] + history
 
         # ------------------------------------------------------
-        # Add /no_think to current user message
+        # Add /no_think to the latest user message
         # ------------------------------------------------------
 
-        if messages:
+        for index in range(len(messages) - 1, 0, -1):
 
-            # Find the latest user message.
-            for index in range(
-                len(messages) - 1,
-                -1,
-                -1,
-            ):
+            if messages[index].get("role") == "user":
 
-                if messages[index].get(
-                    "role"
-                ) == "user":
+                messages[index]["content"] = (
+                    "/no_think\n"
+                    + str(messages[index].get("content", ""))
+                )
 
-                    messages[index] = {
-                        "role": "user",
-                        "content": (
-                            "/no_think\n"
-                            + str(
-                                messages[index].get(
-                                    "content",
-                                    "",
-                                )
-                            )
-                        ),
-                    }
-
-                    break
+                break
 
         # ------------------------------------------------------
-        # Generate response
+        # Generate
         # ------------------------------------------------------
+
+        if STREAM_REPLIES:
+            return self._ask_streaming(messages)
+
+        return self._ask_blocking(messages)
+
+    # ----------------------------------------------------------
+    # Blocking reply (original behaviour)
+    # ----------------------------------------------------------
+
+    def _ask_blocking(self, messages):
 
         response = self.client.chat.completions.create(
             model=MODEL,
@@ -387,49 +539,138 @@ Do not explain anything.
             stream=False,
         )
 
-        content = (
-            response
-            .choices[0]
-            .message
-            .content
+        content = self._strip_think(
+            response.choices[0].message.content
         )
 
         if not content:
+            content = "I couldn't generate a response."
 
-            content = (
-                "I couldn't generate a response."
-            )
-
-        # ------------------------------------------------------
-        # Clean accidental reasoning
-        # ------------------------------------------------------
-
-        content = content.strip()
-
-        if "<think>" in content:
-
-            end = content.find(
-                "</think>"
-            )
-
-            if end != -1:
-
-                content = (
-                    content[
-                        end + len("</think>"):
-                    ]
-                    .strip()
-                )
-
-        # ------------------------------------------------------
-        # Save assistant response
-        # ------------------------------------------------------
-
-        self.memory.add_assistant(
-            content
-        )
+        self.memory.add_assistant(content)
 
         return content
+
+    # ----------------------------------------------------------
+    # Streaming reply: prints tokens as they arrive.
+    #
+    # main.py / voice_command.py only print the returned value
+    # when it is truthy, so after printing we return "" to avoid
+    # showing the answer twice.
+    # ----------------------------------------------------------
+
+    def _ask_streaming(self, messages):
+
+        stream = self.client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=MODEL_TEMPERATURE,
+            max_tokens=MODEL_MAX_TOKENS,
+            stream=True,
+        )
+
+        shown = []
+        state = "start"   # start -> (think ->) stream
+        buffer = ""
+
+        def emit(text):
+
+            if not text:
+                return
+
+            print(text, end="", flush=True)
+            shown.append(text)
+
+        try:
+
+            for chunk in stream:
+
+                if not chunk.choices:
+                    continue
+
+                piece = getattr(
+                    chunk.choices[0].delta,
+                    "content",
+                    None,
+                )
+
+                if not piece:
+                    continue
+
+                if state == "stream":
+                    emit(piece)
+                    continue
+
+                buffer += piece
+
+                # Decide whether the reply begins with <think>.
+                if state == "start":
+
+                    probe = buffer.lstrip()
+
+                    if probe.startswith("<think>"):
+                        state = "think"
+
+                    elif "<think>".startswith(probe):
+                        # Could still turn into <think>; wait.
+                        continue
+
+                    else:
+                        state = "stream"
+                        emit(probe)
+                        buffer = ""
+                        continue
+
+                # Hide a reasoning block entirely.
+                if state == "think":
+
+                    end = buffer.find("</think>")
+
+                    if end != -1:
+                        state = "stream"
+                        emit(
+                            buffer[end + len("</think>"):]
+                            .lstrip()
+                        )
+                        buffer = ""
+
+            # Very short replies may still be buffered.
+            if state == "start" and buffer.strip():
+                emit(buffer.strip())
+
+        except Exception:
+
+            partial = "".join(shown).strip()
+
+            if partial:
+                self.memory.add_assistant(partial)
+
+            raise
+
+        finally:
+
+            close = getattr(stream, "close", None)
+
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        content = "".join(shown).strip()
+
+        # Nothing visible was produced: let the caller print this.
+        if not content:
+
+            content = "I couldn't generate a response."
+
+            self.memory.add_assistant(content)
+
+            return content
+
+        self.memory.add_assistant(content)
+
+        # Already printed above.
+        return ""
 
     # ==========================================================
     # INTENT RESPONSE SCHEMA
@@ -459,6 +700,175 @@ Do not explain anything.
         }
 
     # ==========================================================
+    # COMPACT INTENT PROMPT (built once, then cached)
+    #
+    # The text never changes between calls, so the model server
+    # can reuse its cached processing of this prefix.
+    # ==========================================================
+
+    @staticmethod
+    def _short_description(text, limit=90):
+
+        text = " ".join(str(text).split())
+
+        cut = text.find(". ")
+
+        if cut != -1:
+            text = text[:cut + 1]
+
+        if len(text) > limit:
+            text = text[:limit - 3].rstrip() + "..."
+
+        return text
+
+    def _tool_line(self, name, description, parameters):
+
+        params = []
+
+        if isinstance(parameters, dict):
+
+            for param_name, spec in parameters.items():
+
+                param_type = (
+                    spec.get("type", "string")
+                    if isinstance(spec, dict)
+                    else "string"
+                )
+
+                params.append(f"{param_name}: {param_type}")
+
+        return (
+            f"- {name}({', '.join(params)}): "
+            f"{self._short_description(description)}"
+        )
+
+    @staticmethod
+    def _example(user, action, arguments):
+
+        return (
+            f'User: "{user}"\n'
+            "Return: "
+            + json.dumps(
+                {
+                    "action": action,
+                    "arguments": json.dumps(arguments),
+                    "response": "",
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    def _get_intent_prompt(self):
+
+        descriptions = self.get_tool_descriptions()
+        schemas = self.get_tool_schemas()
+
+        cache_key = tuple(descriptions.keys())
+
+        cached = getattr(self, "_intent_prompt_cache", None)
+
+        if cached and cached[0] == cache_key:
+            return cached[1]
+
+        if descriptions:
+
+            tools_text = "\n".join(
+                self._tool_line(
+                    name,
+                    description,
+                    schemas.get(name, {}),
+                )
+                for name, description in descriptions.items()
+            )
+
+        else:
+
+            tools_text = "No local tools are currently available."
+
+        examples = "\n\n".join(
+            [
+                self._example(
+                    "open vs code",
+                    "open_application",
+                    {"application": "vs code"},
+                ),
+                self._example(
+                    "remember that my name is Alex",
+                    "remember_fact",
+                    {"key": "name", "value": "Alex"},
+                ),
+                self._example(
+                    "what is quantum physics?",
+                    "AI_QUERY",
+                    {},
+                ),
+                self._example(
+                    "open Chrome and go to google.com",
+                    "run_actions",
+                    {
+                        "actions": [
+                            {
+                                "action": "open_application",
+                                "arguments": {"application": "Chrome"},
+                            },
+                            {
+                                "action": "wait",
+                                "arguments": {"seconds": 2},
+                            },
+                            {
+                                "action": "hotkey",
+                                "arguments": {"keys": "ctrl+l"},
+                            },
+                            {
+                                "action": "type_text",
+                                "arguments": {"text": "https://google.com"},
+                            },
+                            {
+                                "action": "press_key",
+                                "arguments": {"key": "enter"},
+                            },
+                        ]
+                    },
+                ),
+            ]
+        )
+
+        prompt = (
+            "You are JARVIS's intent engine. Choose the local tool "
+            "that matches the user's request, or AI_QUERY.\n\n"
+            "Return ONLY a JSON object with keys "
+            '"action", "arguments", "response".\n\n'
+            "Rules:\n"
+            "1. Use a listed tool when the request clearly matches it. "
+            "Never invent tool names.\n"
+            "2. Use the exact parameter names shown; copy user-provided "
+            "values exactly.\n"
+            '3. "arguments" is a JSON-encoded STRING. Use "{}" when the '
+            "tool has no parameters or for AI_QUERY.\n"
+            "4. Use AI_QUERY for questions, explanations, conversation, "
+            "coding, writing and reasoning. Do not answer yourself; "
+            '"response" is always "".\n'
+            "5. If the request needs several steps, use run_actions with "
+            '{"actions":[{"action":<tool>,"arguments":{...}}]}. Nested '
+            "arguments are plain objects. Only use listed tools, no "
+            "nested run_actions, no AI_QUERY inside. Add a wait step "
+            "after opening an app or page. Never use run_actions for a "
+            "request one tool can do.\n"
+            "6. Prefer open_url for a real URL or domain. After opening "
+            "a browser, use hotkey, type_text and press_key.\n"
+            "7. Prefer local computer tools over AI_QUERY whenever they "
+            "can do the job.\n\n"
+            "Tools:\n"
+            f"{tools_text}\n\n"
+            "Examples:\n\n"
+            f"{examples}\n"
+        )
+
+        self._intent_prompt_cache = (cache_key, prompt)
+
+        return prompt
+
+    # ==========================================================
     # INTENT UNDERSTANDING
     # ==========================================================
 
@@ -473,198 +883,7 @@ Do not explain anything.
             self.get_tool_descriptions()
         )
 
-        tool_schemas = (
-            self.get_tool_schemas()
-        )
-
-        # ------------------------------------------------------
-        # Tool descriptions
-        # ------------------------------------------------------
-
-        if tool_descriptions:
-
-            tools_text = "\n".join(
-                f"- {name}: {description}"
-                for name, description
-                in tool_descriptions.items()
-            )
-
-        else:
-
-            tools_text = (
-                "No local tools are currently available."
-            )
-
-        # ------------------------------------------------------
-        # Tool schemas
-        # ------------------------------------------------------
-
-        schemas_text = json.dumps(
-            tool_schemas,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-        # ------------------------------------------------------
-        # Intent system prompt
-        # ------------------------------------------------------
-
-        intent_prompt = f"""
-You are JARVIS's intent engine.
-
-Your job is to understand the user's request and select
-the correct local capability.
-
-Available local capabilities:
-
-{tools_text}
-
-Their exact parameter schemas are:
-
-{schemas_text}
-
-There is also a special action:
-
-AI_QUERY
-
-Use AI_QUERY when the request should be answered
-conversationally by JARVIS instead of being executed
-by a local tool.
-
-Rules:
-
-1. Select a local tool when the request clearly corresponds
-   to one of the registered tools.
-
-2. Use AI_QUERY for normal questions, explanations,
-   conversations, coding, writing, reasoning, and requests
-   that do not correspond to a local tool.
-
-3. Never invent a tool.
-
-4. Use the exact parameter names defined by the selected
-   tool schema.
-
-5. Preserve user-provided values accurately.
-
-6. The "arguments" field MUST be a JSON-encoded string.
-
-7. If the selected tool has no parameters, arguments must be:
-
-"{{}}"
-
-8. If AI_QUERY is selected, arguments must be:
-
-"{{}}"
-
-9. The "response" field must always be an empty string.
-
-10. Do not answer the user's question yourself.
-
-11. Return ONLY valid JSON.
-
-12. Use "run_actions" when the user's request requires
-    multiple local actions.
-
-13. Every action inside "run_actions" MUST use an existing
-    registered tool.
-
-14. Execute actions in the exact order required by the user.
-
-15. Never invent action names inside "run_actions".
-
-16. Do not use "run_actions" for a simple request that can
-    be completed by one local tool.
-
-17. Do not use AI_QUERY when the user's request can be
-    performed by the available local computer tools.
-
-18. For computer automation, prefer existing local tools.
-
-19. "run_actions" must contain an "actions" array.
-
-20. Each item in "actions" must have this form:
-
-{{
-    "action": "existing_tool_name",
-    "arguments": {{}}
-}}
-
-21. Do not put "run_actions" inside another "run_actions".
-
-22. Use short, reliable action sequences.
-
-23. Add a "wait" action when an application or webpage
-    needs time to open before the next action.
-
-24. When opening a website, prefer "open_url" when the user
-    provides an actual URL or domain.
-
-25. When interacting with a browser after opening it,
-    use keyboard and mouse primitives.
-
-Examples:
-
-User:
-"open vs code"
-
-Return:
-{{
-    "action": "open_application",
-    "arguments": "{{\\"application\\": \\"vs code\\"}}",
-    "response": ""
-}}
-
-User:
-"copy hello world"
-
-Return:
-{{
-    "action": "set_clipboard",
-    "arguments": "{{\\"text\\": \\"hello world\\"}}",
-    "response": ""
-}}
-
-User:
-"remember that my name is Alex"
-
-Return:
-{{
-    "action": "remember_fact",
-    "arguments": "{{\\"key\\": \\"name\\", \\"value\\": \\"Alex\\"}}",
-    "response": ""
-}}
-
-User:
-"what is quantum physics?"
-
-Return:
-{{
-    "action": "AI_QUERY",
-    "arguments": "{{}}",
-    "response": ""
-}}
-
-User:
-"open Chrome and go to google.com"
-
-Return:
-{{
-    "action": "run_actions",
-    "arguments": "{{\\"actions\\":[{{\\"action\\":\\"open_application\\",\\"arguments\\":{{\\"application\\":\\"Chrome\\"}}}},{{\\"action\\":\\"wait\\",\\"arguments\\":{{\\"seconds\\":2}}}},{{\\"action\\":\\"hotkey\\",\\"arguments\\":{{\\"keys\\":\\"ctrl+l\\"}}}},{{\\"action\\":\\"type_text\\",\\"arguments\\":{{\\"text\\":\\"https://google.com\\"}}}},{{\\"action\\":\\"press_key\\",\\"arguments\\":{{\\"key\\":\\"enter\\"}}}}]}}",
-    "response": ""
-}}
-
-User:
-"open Notepad and type hello JARVIS"
-
-Return:
-{{
-    "action": "run_actions",
-    "arguments": "{{\\"actions\\":[{{\\"action\\":\\"open_application\\",\\"arguments\\":{{\\"application\\":\\"Notepad\\"}}}},{{\\"action\\":\\"wait\\",\\"arguments\\":{{\\"seconds\\":2}}}},{{\\"action\\":\\"type_text\\",\\"arguments\\":{{\\"text\\":\\"hello JARVIS\\"}}}}]}}",
-    "response": ""
-}}
-"""
+        intent_prompt = self._get_intent_prompt()
 
         # ------------------------------------------------------
         # Build messages
@@ -711,8 +930,8 @@ Return:
             {
                 "role": "user",
                 "content": (
+                    user_input +
                     "/no_think\n"
-                    + user_input
                 ),
             }
         )
