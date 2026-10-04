@@ -9,6 +9,9 @@ from app.tools import register_tools
 # pyrefly: ignore [missing-import]
 from app.computer_agent import ComputerAgent
 
+# pyrefly: ignore [missing-import]
+from app import config as _config
+
 
 class JarvisRouter:
 
@@ -59,9 +62,28 @@ class JarvisRouter:
             },
         )
 
+        self.registry.register(
+            "search_web",
+            self._search_web_tool,
+            description=(
+                "Search Google in the browser. Use this for any web "
+                "search request."
+            ),
+            parameters={
+                "query": {"type": "string"},
+            },
+        )
+
         self.brain.set_tool_registry(
             self.registry
         )
+
+        if (
+            getattr(_config, "WARM_UP", False)
+            and getattr(_config, "USE_NATIVE_TOOLS", True)
+        ):
+            print("Loading model...", flush=True)
+            self.brain.warm_up()
 
     # ============================================================
     # COMPUTER AGENT TOOL ADAPTERS
@@ -194,6 +216,16 @@ class JarvisRouter:
         # --------------------------------------------------------
         # AI INTENT ENGINE
         # --------------------------------------------------------
+
+        # --------------------------------------------------------
+        # NATIVE TOOL CALLING (one model call; set
+        # USE_NATIVE_TOOLS = False in config.py for the old flow)
+        # --------------------------------------------------------
+        if getattr(_config, "USE_NATIVE_TOOLS", True):
+            return self.brain.agent_turn(
+                user_input,
+                self._agent_execute,
+            )
 
         decision = self.brain.understand(
             user_input
@@ -1712,6 +1744,18 @@ class JarvisRouter:
         if not original_text:
             return None
 
+        # "open chrome and search for X" -> "search for X"
+        lead = re.match(
+            r"^(?:please\s+)?(?:jarvis[,\s]+)?(?:open|launch|start)\s+"
+            r"(?:google\s+)?(?:chrome|google chrome|the browser|my browser|browser|edge)"
+            r"\s*(?:,|and\s+then|and|then)\s*",
+            original_text,
+            re.IGNORECASE,
+        )
+
+        if lead:
+            original_text = original_text[lead.end():].strip()
+
         lowered = (
             original_text.lower()
         )
@@ -1744,6 +1788,8 @@ class JarvisRouter:
                     return query
 
         prefixes = (
+            "search the web for ",
+            "search online for ",
             "search for ",
             "search ",
             "look up ",
@@ -3025,3 +3071,42 @@ class JarvisRouter:
                 pass
 
             return error_message
+
+    # ============================================================
+    # TOOL EXECUTION FOR THE NATIVE TOOL-CALLING LOOP
+    # ============================================================
+
+    def _agent_execute(self, name, arguments):
+        """
+        Run a tool through execute() so all special handling is kept
+        (OCR clicks with recovery, open_url wording, last opened app).
+
+        execute() also appends the result to conversation memory;
+        the agent loop stores its own final reply, so undo that to
+        avoid duplicate messages in the history.
+        """
+
+        memory = self.brain.memory
+        mark = len(memory.messages)
+
+        try:
+            return self.execute(name, arguments)
+        finally:
+            del memory.messages[mark:]
+
+    def _search_web_tool(self, query):
+        """Open a Google search. Lets a small model just pass the query."""
+
+        from urllib.parse import quote_plus
+
+        query = str(query or "").strip()
+
+        if not query:
+            return "I couldn't tell what to search for."
+
+        self.registry.execute(
+            "open_url",
+            {"url": "https://www.google.com/search?q=" + quote_plus(query)},
+        )
+
+        return f"Searching Google for {query}."

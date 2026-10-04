@@ -1,4 +1,5 @@
 import json
+import time
 
 import re
 from urllib.parse import quote_plus
@@ -7,7 +8,7 @@ from urllib.parse import quote_plus
 
 # pyrefly: ignore [missing-import]
 
-from openai import BadRequestError, OpenAI
+from openai import APIConnectionError, BadRequestError, OpenAI
 
 
 
@@ -136,9 +137,9 @@ class JarvisBrain:
 
             api_key=MODEL_API_KEY,
 
-            timeout=30,
+            timeout=getattr(_config, "CLIENT_TIMEOUT", 20),
 
-            max_retries=2,
+            max_retries=getattr(_config, "CLIENT_RETRIES", 1),
 
         )
 
@@ -2415,3 +2416,402 @@ Do not explain anything.
             ),
 
         }
+
+
+    # ==========================================================
+    # NATIVE TOOL CALLING  (one model call per step)
+    #
+    # Replaces understand() + ask() (two cloud round trips) with a
+    # single call that either answers or calls a tool.
+    # ==========================================================
+
+    _OPTIONAL_PARAMS = {"position"}
+
+    def _agent_tools(self):
+        """OpenAI-format tool list built from the curated AGENT_TOOLS."""
+
+        cached = getattr(self, "_agent_tools_cache", None)
+
+        if cached is not None:
+            return cached
+
+        registry = self.tool_registry
+        allowed = getattr(_config, "AGENT_TOOLS", None)
+
+        tools = []
+        specs = {}
+
+        if registry:
+
+            names = allowed or list(registry.tools.keys())
+
+            for name in names:
+
+                tool = registry.get(name)
+
+                if not tool:
+                    continue
+
+                props = {}
+
+                for pname, spec in (tool.get("parameters") or {}).items():
+
+                    ptype = (
+                        spec.get("type", "string")
+                        if isinstance(spec, dict)
+                        else "string"
+                    )
+
+                    if ptype not in {
+                        "string", "integer", "number", "boolean"
+                    }:
+                        ptype = "string"
+
+                    props[pname] = {"type": ptype}
+
+                tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": " ".join(
+                                str(tool.get("description", "")).split()
+                            )[:getattr(_config, "TOOL_DESC_LIMIT", 240)],
+                            "parameters": {
+                                "type": "object",
+                                "properties": props,
+                                "required": [
+                                    p for p in props
+                                    if p not in self._OPTIONAL_PARAMS
+                                ],
+                            },
+                        },
+                    }
+                )
+
+                specs[name] = props
+
+        self._agent_tools_cache = tools
+        self._agent_specs = specs
+
+        return tools
+
+    def _coerce_args(self, name, args):
+        """Models sometimes send "2" for 2. Fix types from the schema."""
+
+        specs = getattr(self, "_agent_specs", {}).get(name, {})
+        fixed = {}
+
+        for key, value in (args or {}).items():
+
+            ptype = specs.get(key, {}).get("type")
+
+            try:
+                if ptype == "integer" and not isinstance(value, bool):
+                    value = int(float(value))
+                elif ptype == "number" and not isinstance(value, bool):
+                    value = float(value)
+                elif ptype == "boolean" and isinstance(value, str):
+                    value = value.strip().lower() in {"true", "yes", "1"}
+                elif ptype == "string" and not isinstance(value, str):
+                    value = (
+                        json.dumps(value)
+                        if isinstance(value, (dict, list))
+                        else str(value)
+                    )
+            except (TypeError, ValueError):
+                pass
+
+            fixed[key] = value
+
+        return fixed
+
+    @staticmethod
+    def _result_text(result, limit=1500):
+
+        if result is None:
+            return "Done."
+
+        if isinstance(result, (dict, list)):
+            try:
+                text = json.dumps(result, ensure_ascii=False, default=str)
+            except Exception:
+                text = str(result)
+        else:
+            text = str(result)
+
+        return text[:limit]
+
+    def _chat(self, **kwargs):
+        """chat.completions.create with reasoning_effort when supported."""
+
+        effort = getattr(_config, "REASONING_EFFORT", "")
+
+        if effort and getattr(self, "_reasoning_ok", True):
+
+            try:
+                return self.client.chat.completions.create(
+                    extra_body={"reasoning_effort": effort},
+                    **kwargs,
+                )
+            except BadRequestError as error:
+
+                if "reasoning" not in str(error).lower():
+                    raise
+
+                # This model doesn't support it; stop sending it.
+                self._reasoning_ok = False
+
+        return self.client.chat.completions.create(**kwargs)
+
+    def agent_turn(self, user_input, execute_tool):
+        """
+        Handle one user request with native tool calling.
+
+        execute_tool(name, arguments) runs a tool and returns its
+        result (the router supplies this).  Returns the reply text.
+        """
+
+        self.memory.add_user(user_input)
+        self._cap_stored_history()
+
+        tools = self._agent_tools()
+
+        system_content = (
+            self.system_prompt
+            + getattr(_config, "AGENT_PROMPT", "")
+            + self.get_memory_context(user_input)
+        )
+
+        history = [
+            dict(message)
+            for message in self.memory.get_messages()
+            if message.get("role") != "system"
+        ][-HISTORY_MESSAGES:]
+
+        messages = [
+            {"role": "system", "content": system_content}
+        ] + history
+
+        max_steps = getattr(_config, "AGENT_MAX_STEPS", 4)
+        max_tokens = getattr(_config, "AGENT_MAX_TOKENS", 600)
+        single_shot = set(getattr(_config, "SINGLE_SHOT_TOOLS", []))
+        timing = getattr(_config, "DEBUG_TIMING", False)
+
+        use_tools = bool(tools)
+        last_result = ""
+        started = time.perf_counter()
+
+        for step in range(max_steps):
+
+            request = dict(
+                model=MODEL,
+                messages=messages,
+                temperature=MODEL_TEMPERATURE,
+                max_tokens=max_tokens,
+            )
+
+            if use_tools:
+                request["tools"] = tools
+                if getattr(_config, "SEND_TOOL_CHOICE", True):
+                    request["tool_choice"] = "auto"
+
+            t0 = time.perf_counter()
+
+            try:
+                response = self._chat(**request)
+
+            except APIConnectionError:
+
+                message = (
+                    "I can't reach the model server at "
+                    f"{MODEL_BASE_URL}. If you use Ollama, make sure it is "
+                    "running (open the Ollama app or run: ollama serve)."
+                )
+
+                self.memory.add_assistant(message)
+                return message
+
+            except BadRequestError as error:
+
+                text = str(error).lower()
+
+                if use_tools and (
+                    "tool_use_failed" in text
+                    or "failed_generation" in text
+                ):
+                    # Malformed tool call: answer in plain text instead.
+                    use_tools = False
+                    request.pop("tools", None)
+                    request.pop("tool_choice", None)
+                    response = self._chat(**request)
+
+                else:
+                    raise
+
+            message = response.choices[0].message
+            calls = getattr(message, "tool_calls", None) or []
+
+            if timing:
+                print(
+                    f"\n[timing] model call {step + 1}: "
+                    f"{time.perf_counter() - t0:.2f}s "
+                    f"({len(calls)} tool call(s))",
+                    flush=True,
+                )
+
+            # ---------------- final answer ----------------
+            if not calls:
+
+                content = self._strip_think(message.content)
+
+                if not content:
+                    content = last_result or "I couldn't generate a response."
+
+                if timing:
+                    print(
+                        f"[timing] total: "
+                        f"{time.perf_counter() - started:.2f}s",
+                        flush=True,
+                    )
+
+                self.memory.add_assistant(content)
+                return content
+
+            # ---------------- run the tools ----------------
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": call.function.arguments or "{}",
+                            },
+                        }
+                        for call in calls
+                    ],
+                }
+            )
+
+            results = []
+
+            for call in calls:
+
+                name = call.function.name
+
+                try:
+                    args = json.loads(call.function.arguments or "{}")
+                except Exception:
+                    args = None
+
+                if name not in getattr(self, "_agent_specs", {}):
+                    result = f"Unknown tool '{name}'."
+
+                elif not isinstance(args, dict):
+                    result = "The tool arguments were not valid JSON."
+
+                else:
+                    t1 = time.perf_counter()
+
+                    try:
+                        result = execute_tool(
+                            name,
+                            self._coerce_args(name, args),
+                        )
+                    except Exception as error:
+                        result = f"Tool error: {error}"
+
+                    if timing:
+                        print(
+                            f"[timing] tool {name}: "
+                            f"{time.perf_counter() - t1:.2f}s",
+                            flush=True,
+                        )
+
+                text = self._result_text(result)
+                results.append((name, text))
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": text,
+                    }
+                )
+
+            last_result = results[-1][1]
+
+            # Simple one-shot actions: the tool already says what
+            # happened, so skip the second model call.
+            if (
+                len(results) == 1
+                and results[0][0] in single_shot
+                and len(results[0][1]) < 200
+            ):
+                if timing:
+                    print(
+                        f"[timing] total: "
+                        f"{time.perf_counter() - started:.2f}s",
+                        flush=True,
+                    )
+
+                self.memory.add_assistant(results[0][1])
+                return results[0][1]
+
+        content = (
+            "I couldn't finish that in a few steps. "
+            "Could you rephrase it or break it down?"
+        )
+
+        self.memory.add_assistant(content)
+        return content
+
+    def warm_up(self):
+        """
+        Load the model and prime the prompt cache with the system prompt
+        and tool list, so the first real command is fast.
+        """
+
+        tools = self._agent_tools()
+
+        system_content = (
+            self.system_prompt
+            + getattr(_config, "AGENT_PROMPT", "")
+            + self.get_memory_context("")
+        )
+
+        request = dict(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": "hi"},
+            ],
+            temperature=0,
+            max_tokens=1,
+        )
+
+        if tools:
+            request["tools"] = tools
+
+        t0 = time.perf_counter()
+
+        try:
+            self.client.chat.completions.create(**request)
+
+        except APIConnectionError:
+            print(
+                f"Can't reach the model server at {MODEL_BASE_URL}. "
+                "If you use Ollama, open the Ollama app or run: ollama serve"
+            )
+            return False
+
+        except Exception as error:
+            print(f"Warm-up skipped: {error}")
+            return False
+
+        print(f"Model ready ({time.perf_counter() - t0:.1f}s).")
+        return True
