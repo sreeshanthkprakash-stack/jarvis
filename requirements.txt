@@ -9,3 +9,4 @@ openwakeword
 sounddevice
 faster-whisper
 pyttsx3
+numpy

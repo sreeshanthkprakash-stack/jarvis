@@ -1,3 +1,8 @@
+import difflib
+import hashlib
+import math
+import os
+import re
 import time
 import webbrowser
 from pathlib import Path
@@ -19,11 +24,35 @@ pytesseract.pytesseract.tesseract_cmd = (
 # WEB / URL
 # ============================================================
 
+# "spotify:search:ishq", "ms-settings:display", "mailto:a@b.c" ...
+# (a colon followed by a digit is a port, e.g. localhost:8000)
+_APP_LINK_RE = re.compile(r"^[a-z][a-z0-9+.\-]*:(?!\d)", re.IGNORECASE)
+
+
 def open_url(url):
+
     if not isinstance(url, str) or not url.strip():
         raise ValueError("URL must be a non-empty string.")
 
     url = url.strip()
+
+    lowered = url.lower()
+
+    if (
+        _APP_LINK_RE.match(url)
+        and not lowered.startswith(("http://", "https://", "file:"))
+        and hasattr(os, "startfile")
+    ):
+        # Hand app links to Windows (opens Spotify, Settings, ...).
+        try:
+            os.startfile(url)
+        except OSError as error:
+            raise ValueError(
+                f"Windows could not open '{url}'. "
+                f"Is the app installed? ({error})"
+            )
+
+        return f"Opened {url}."
 
     webbrowser.open(url)
 
@@ -189,21 +218,190 @@ def _normalize_ocr_text(text):
     )
 
 
+# Screens wider than this are shrunk before OCR (coordinates are scaled
+# back, so nothing else changes). 1080p screens are left alone.
+# 0 = never shrink.   Override: JARVIS_OCR_MAX_WIDTH in .env
+try:
+    _OCR_MAX_WIDTH = int(os.getenv("JARVIS_OCR_MAX_WIDTH", "1920"))
+except ValueError:
+    _OCR_MAX_WIDTH = 1920
+
+# Result of the last OCR run, keyed by the exact pixels of the screen.
+# Identical screen -> identical text, so OCR is skipped.
+_ocr_cache = {"key": None, "data": None, "time": 0.0, "epoch": -1, "fingerprint": None, "size": None}
+
+# Counts mouse/keyboard actions. A cached OCR result is only trusted while
+# no action has happened since it was made.
+_input_epoch = [0]
+
+
+def _count_input(function):
+
+    def wrapper(*args, **kwargs):
+        _input_epoch[0] += 1
+        return function(*args, **kwargs)
+
+    wrapper._jarvis_wrapped = True
+    wrapper.__wrapped__ = function
+
+    return wrapper
+
+
+for _name in (
+    "click", "doubleClick", "rightClick", "middleClick", "moveTo",
+    "moveRel", "drag", "dragTo", "scroll", "write", "typewrite",
+    "press", "hotkey", "keyDown", "keyUp",
+):
+    _function = getattr(pyautogui, _name, None)
+
+    if callable(_function) and not getattr(_function, "_jarvis_wrapped", False):
+        setattr(pyautogui, _name, _count_input(_function))
+
+# Size and a 64x36 thumbnail of the last captured screen.
+_screen_info = {"size": None, "fingerprint": None}
+
+
+def _fingerprint(image):
+    """Tiny grayscale thumbnail used to tell if the screen changed."""
+
+    small = image.convert("L").resize((64, 36))
+
+    return list(small.getdata())
+
+
+def _fingerprint_distance(a, b):
+    """Average brightness difference (0-255) between two thumbnails."""
+
+    if not a or not b or len(a) != len(b):
+        return 255.0
+
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
+def _ocr_debug():
+    try:
+        # pyrefly: ignore [missing-import]
+        from app import config
+        return bool(getattr(config, "DEBUG_TIMING", False))
+    except Exception:
+        return False
+
+
+def _copy_ocr_data(data):
+    return {key: list(values) for key, values in data.items()}
+
+
 def _get_ocr_data():
     """
     Capture the current screen and run
     local Tesseract OCR.
 
     No external API is used.
+
+    Speed-ups (results are identical):
+    - same screen as last time -> reuse the previous OCR result
+    - grayscale image (smaller to encode, same text)
+    - very large screens are shrunk, then coordinates scaled back
     """
+
+    from PIL import Image
+
+    started = time.perf_counter()
 
     screenshot = pyautogui.screenshot()
 
-    return pytesseract.image_to_data(
-        screenshot,
+    _screen_info["size"] = screenshot.size
+    _screen_info["fingerprint"] = _fingerprint(screenshot)
+
+    key = (
+        screenshot.size,
+        hashlib.md5(screenshot.tobytes()).hexdigest(),
+    )
+
+    captured = time.perf_counter()
+
+    now = time.perf_counter()
+
+    cached = _ocr_cache["data"] is not None
+
+    same_pixels = cached and _ocr_cache["key"] == key
+
+    # A blinking text cursor changes a few pixels between two reads of
+    # an otherwise unchanged screen. If nothing was clicked or typed
+    # since, and the last read was moments ago, it is still the same screen.
+    looks_same = (
+        cached
+        and _ocr_cache["size"] == screenshot.size
+        and _ocr_cache["epoch"] == _input_epoch[0]
+        and now - _ocr_cache["time"] < 1.0
+        and _fingerprint_distance(
+            _ocr_cache["fingerprint"],
+            _screen_info["fingerprint"],
+        ) < 1.5
+    )
+
+    if same_pixels or looks_same:
+
+        if _ocr_debug():
+            print(
+                f"[ocr] same screen, reused result "
+                f"({captured - started:.2f}s)",
+                flush=True,
+            )
+
+        return _copy_ocr_data(_ocr_cache["data"])
+
+    image = screenshot.convert("L")
+    scale = 1.0
+
+    if _OCR_MAX_WIDTH and image.width > _OCR_MAX_WIDTH:
+
+        scale = _OCR_MAX_WIDTH / image.width
+
+        image = image.resize(
+            (
+                _OCR_MAX_WIDTH,
+                max(1, round(image.height * scale)),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+
+    data = pytesseract.image_to_data(
+        image,
         output_type=pytesseract.Output.DICT,
         config="--psm 11",
     )
+
+    if scale != 1.0:
+
+        inverse = 1.0 / scale
+
+        for field in ("left", "top", "width", "height"):
+
+            try:
+                data[field] = [
+                    int(round(float(value) * inverse))
+                    for value in data[field]
+                ]
+            except (KeyError, TypeError, ValueError):
+                pass
+
+    _ocr_cache["key"] = key
+    _ocr_cache["data"] = _copy_ocr_data(data)
+    _ocr_cache["time"] = time.perf_counter()
+    _ocr_cache["epoch"] = _input_epoch[0]
+    _ocr_cache["fingerprint"] = _screen_info["fingerprint"]
+    _ocr_cache["size"] = screenshot.size
+
+    if _ocr_debug():
+        print(
+            f"[ocr] capture {captured - started:.2f}s | "
+            f"recognise {time.perf_counter() - captured:.2f}s"
+            + (f" | shrunk x{scale:.2f}" if scale != 1.0 else ""),
+            flush=True,
+        )
+
+    return data
 
 
 def _build_ocr_words(ocr_data):
@@ -1535,3 +1733,324 @@ def describe_screen():
         ),
         "elements": visible_elements,
     }
+
+
+# ============================================================
+# SMART TARGETING  (the model decides WHICH match to click)
+# ============================================================
+#
+#   find_on_screen("router.py")  -> every match, with where it is
+#   click_match(2)               -> click the one chosen
+#   read_screen()                -> what text is visible (to verify)
+#
+# The old "click X" took the first OCR hit (top-left). With several
+# matches that is a guess; here the caller sees them all.
+
+_last_matches = {"query": "", "items": [], "fingerprint": None}
+
+# Mean brightness change above which the screen counts as "different".
+_STALE_LEVEL = 5.0
+
+
+def _region_of(x, y, size):
+
+    width, height = size or (0, 0)
+
+    if not width or not height:
+        return "screen"
+
+    fx, fy = x / width, y / height
+
+    if fy < 0.07:
+        return "top bar"
+
+    if fy > 0.93:
+        return "bottom bar"
+
+    if fx < 0.22:
+        return "left panel"
+
+    if fx > 0.78:
+        return "right panel"
+
+    return "main area"
+
+
+def _screen_words():
+
+    words = _build_ocr_words(_get_ocr_data())
+
+    return words, _group_ocr_words(words)
+
+
+def _find_word_runs(words, target):
+    """
+    Every occurrence of the target, as runs of consecutive OCR words.
+    Exact matches first; for a single longer word, also accept
+    words that merely contain it (OCR often glues on punctuation).
+    """
+
+    parts = target.split()
+    count = len(parts)
+    runs = []
+
+    for start in range(len(words) - count + 1):
+
+        window = words[start:start + count]
+
+        if [word["text"] for word in window] == parts:
+            runs.append(window)
+
+    if runs or count != 1 or len(parts[0]) < 3:
+        return runs
+
+    return [[word] for word in words if parts[0] in word["text"]]
+
+
+def _nearby_text(cx, cy, words, target, limit=2, radius=450):
+    """Short labels next to a match, so the choice can be described."""
+
+    parts = set(target.split())
+
+    scored = []
+    seen = set()
+
+    for word in words:
+
+        text = word["text"]
+
+        if len(text) < 3 or text in parts or target in text or text in seen:
+            continue
+
+        distance = math.hypot(
+            word["left"] + word["width"] / 2 - cx,
+            word["top"] + word["height"] / 2 - cy,
+        )
+
+        if distance <= radius:
+            seen.add(text)
+            scored.append((distance, text))
+
+    scored.sort()
+
+    return [text[:20] for _, text in scored[:limit]]
+
+
+def screen_matches(text, limit=8):
+    """
+    Find every occurrence of text on screen.
+
+    Returns a list of {id, text, x, y, region, near} and remembers it
+    for click_match().
+    """
+
+    target = _normalize_ocr_text(text)
+
+    if not target:
+        raise ValueError("Text must be a non-empty string.")
+
+    words, elements = _screen_words()
+
+    size = _screen_info["size"] or pyautogui.size()
+
+    items = []
+
+    for run in _find_word_runs(words, target)[:limit]:
+
+        cx, cy = _get_match_center(run)
+
+        items.append(
+            {
+                "id": len(items) + 1,
+                "text": " ".join(word["text"] for word in run),
+                "x": cx,
+                "y": cy,
+                "region": _region_of(cx, cy, size),
+                "near": _nearby_text(cx, cy, words, target),
+            }
+        )
+
+    _last_matches["query"] = str(text).strip()
+    _last_matches["items"] = items
+    _last_matches["fingerprint"] = _screen_info["fingerprint"]
+
+    # Remember similar words for the "not found" message.
+    _last_matches["similar"] = (
+        difflib.get_close_matches(
+            target,
+            sorted({word["text"] for word in words}),
+            n=3,
+            cutoff=0.7,
+        )
+        if not items and len(target.split()) == 1
+        else []
+    )
+
+    return items
+
+
+def describe_match(item):
+    """'top bar, near "config.py", "brain.py"'"""
+
+    near = item.get("near") or []
+
+    if near:
+        labels = ", ".join(f'"{label}"' for label in near)
+        return f"{item['region']}, near {labels}"
+
+    return item["region"]
+
+
+def find_on_screen(text):
+    """Look for text on screen and list every match and where it is."""
+
+    items = screen_matches(text)
+
+    text = str(text).strip()
+
+    if not items:
+
+        similar = _last_matches.get("similar") or []
+
+        hint = (
+            " Similar text on screen: "
+            + ", ".join(f'"{word}"' for word in similar)
+            + "."
+            if similar
+            else ""
+        )
+
+        return f"I can't see '{text}' on the screen.{hint}"
+
+    if len(items) == 1:
+        return (
+            f"Found 1 match for '{text}': "
+            f"[1] {describe_match(items[0])}. "
+            "Call click_match(1) to click it."
+        )
+
+    lines = [f"Found {len(items)} matches for '{text}':"]
+
+    for item in items:
+        lines.append(f"[{item['id']}] {describe_match(item)}")
+
+    lines.append(
+        "Pick the one that fits the request, or ask the user which one."
+    )
+
+    return "\n".join(lines)
+
+
+def _as_bool(value):
+
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+
+    return bool(value)
+
+
+def click_match(number, double=False):
+    """Click one of the matches listed by the last find_on_screen."""
+
+    try:
+        index = int(float(number))
+    except (TypeError, ValueError):
+        raise ValueError("number must be a match number from find_on_screen.")
+
+    item = next(
+        (item for item in _last_matches["items"] if item["id"] == index),
+        None,
+    )
+
+    if item is None:
+        return (
+            f"There is no match number {index}. "
+            "Call find_on_screen first."
+        )
+
+    # Don't click blind if the screen moved since it was read.
+    current = _fingerprint(pyautogui.screenshot())
+
+    previous = _last_matches.get("fingerprint")
+
+    if (
+        previous is not None
+        and _fingerprint_distance(previous, current) > _STALE_LEVEL
+    ):
+        return (
+            "The screen changed since I looked, so I did not click. "
+            "Call find_on_screen again."
+        )
+
+    pyautogui.moveTo(item["x"], item["y"], duration=0.15)
+
+    if _as_bool(double):
+        pyautogui.doubleClick()
+        verb = "Double-clicked"
+    else:
+        pyautogui.click()
+        verb = "Clicked"
+
+    return f"{verb} [{index}] '{item['text']}' in the {item['region']}."
+
+
+def read_screen():
+    """
+    Visible text grouped by screen area, in reading order.
+    Compact on purpose: it is read by a small model.
+    """
+
+    _, elements = _screen_words()
+
+    size = _screen_info["size"] or pyautogui.size()
+
+    areas = {
+        "top bar": [],
+        "left panel": [],
+        "main area": [],
+        "right panel": [],
+        "bottom bar": [],
+    }
+
+    budget = {
+        "top bar": 250,
+        "left panel": 300,
+        "main area": 600,
+        "right panel": 150,
+        "bottom bar": 100,
+    }
+
+    for element in elements:
+
+        text = str(element.get("text", "")).strip()
+
+        if len(text) < 2 or not any(ch.isalnum() for ch in text):
+            continue
+
+        if element.get("confidence", 100) < 50:
+            continue
+
+        areas[
+            _region_of(element["x"], element["y"], size)
+        ].append(element)
+
+    lines = [f"Screen {size[0]}x{size[1]}. Visible text:"]
+
+    for area, items in areas.items():
+
+        if not items:
+            continue
+
+        items.sort(key=lambda e: (round(e["y"] / 18), e["x"]))
+
+        joined = " | ".join(item["text"] for item in items)
+
+        if len(joined) > budget[area]:
+            joined = joined[: budget[area]].rsplit(" | ", 1)[0] + " | ..."
+
+        lines.append(f"[{area}] {joined}")
+
+    if len(lines) == 1:
+        return "I can't read any text on the screen."
+
+    return "\n".join(lines)

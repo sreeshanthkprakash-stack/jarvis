@@ -397,6 +397,7 @@ source = { editable = "." }
 dependencies = [
     { name = "faster-whisper" },
     { name = "groq" },
+    { name = "numpy" },
     { name = "openai" },
     { name = "openwakeword" },
     { name = "pillow" },
@@ -413,6 +414,7 @@ dependencies = [
 requires-dist = [
     { name = "faster-whisper", specifier = ">=1.2.1" },
     { name = "groq", specifier = ">=1.7.0" },
+    { name = "numpy", specifier = ">=2.5.3" },
     { name = "openai", specifier = ">=3.24.0" },
     { name = "openwakeword", specifier = ">=0.4.0" },
     { name = "pillow", specifier = ">=12.3.0" },

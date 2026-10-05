@@ -101,7 +101,7 @@ REASONING_EFFORT = "" if LOCAL else os.getenv("GROQ_REASONING_EFFORT", "low")
 USE_NATIVE_TOOLS = True
 
 # Max model<->tool rounds for a single request.
-AGENT_MAX_STEPS = 4
+AGENT_MAX_STEPS = 8
 AGENT_MAX_TOKENS = 300 if LOCAL else 600
 
 # Fewer messages = less to process on each local call.
@@ -126,8 +126,7 @@ _CLOUD_TOOLS = [
     "open_application", "close_application",
     "open_url", "search_web",
     "type_text", "press_key", "hotkey", "wait",
-    "computer_click_target", "computer_click_spatial",
-    "describe_screen",
+    "find_on_screen", "click_match", "read_screen",
     "volume_up", "volume_down", "mute_volume", "lock_computer",
     "get_time", "get_date", "get_system_info",
     "take_screenshot", "get_clipboard", "set_clipboard",
@@ -140,8 +139,7 @@ _LOCAL_TOOLS = [
     "open_application", "close_application",
     "open_url", "search_web",
     "type_text", "press_key", "hotkey", "wait",
-    "computer_click_target",
-    "describe_screen",
+    "find_on_screen", "click_match", "read_screen",
     "volume_up", "volume_down", "mute_volume", "lock_computer",
     "remember_fact",
 ]
@@ -160,9 +158,12 @@ AGENT_PROMPT = """
 
 Tool use:
 - Use a tool whenever the user wants something done on the computer. Otherwise just answer.
-- For multi-step tasks, request all independent steps together, in order. Use wait after opening an app or page.
-- To search the web, call search_web with the query. To open a specific website, call open_url.
-- Use the exact values the user gave. Never invent app names, URLs or file paths.
-- After tools run, reply in one short sentence. If a tool reported an error, say so; never claim success.
-- If the request is too ambiguous to act on, ask one short question.
+- Request independent steps together, in order. Use wait after opening an app or page.
+- To search the web call search_web. To open a website or an app link (like spotify:search:song) call open_url.
+- To click something on screen: call find_on_screen(text). One match: click_match(1). Several matches: pick the one that fits what the user said (tab, sidebar, menu...). If you can't tell, ask the user which one, naming the places. Never guess.
+- You cannot see the screen unless you call read_screen. Use it to check results.
+- type_text only works if a text box is focused. Click the box or use a shortcut first.
+- Never say a task is done unless a tool result or read_screen confirms it. If a result says "Not verified", say what you did and that you could not confirm it. If something failed, say so.
+- Playing a song on Spotify: open_url spotify:search:<song>, wait 3, find_on_screen with the song title, click_match(number, double=true) on the song in the list, then read_screen to confirm.
+- Reply in one short sentence.
 """

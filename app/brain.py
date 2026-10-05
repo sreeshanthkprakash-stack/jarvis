@@ -2425,7 +2425,7 @@ Do not explain anything.
     # single call that either answers or calls a tool.
     # ==========================================================
 
-    _OPTIONAL_PARAMS = {"position"}
+    _OPTIONAL_PARAMS = {"position", "double"}
 
     def _agent_tools(self):
         """OpenAI-format tool list built from the curated AGENT_TOOLS."""

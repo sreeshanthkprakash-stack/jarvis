@@ -1931,6 +1931,7 @@ class ComputerAgent:
         expected_text=None,
 
         wait_seconds=0.5,
+        before=None,
 
     ):
 
@@ -1942,7 +1943,8 @@ class ComputerAgent:
 
 
 
-        before = self.observe()
+        if before is None:
+            before = self.observe()
 
 
 
@@ -2589,6 +2591,7 @@ class ComputerAgent:
         wait_seconds=0.5,
 
         max_retries=1,
+        before=None,
 
     ):
 
@@ -2667,6 +2670,7 @@ class ComputerAgent:
             expected_text,
 
             wait_seconds,
+            before=before,
 
         )
 
@@ -2875,6 +2879,7 @@ class ComputerAgent:
 
 
         steps = []
+        previous_after = None
 
 
 
@@ -2891,6 +2896,7 @@ class ComputerAgent:
                 wait_seconds=0.5,
 
                 max_retries=1,
+                before=previous_after,
 
             )
 
@@ -2901,6 +2907,7 @@ class ComputerAgent:
                 step
 
             )
+            previous_after = step.get("final_screen")
 
 
 
@@ -2926,7 +2933,11 @@ class ComputerAgent:
 
 
 
-        final_screen = self.observe()
+        final_screen = (
+            previous_after
+            if previous_after is not None
+            else self.observe()
+        )
 
 
 

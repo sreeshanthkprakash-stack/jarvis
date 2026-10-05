@@ -74,6 +74,44 @@ class JarvisRouter:
             },
         )
 
+        # pyrefly: ignore [missing-import]
+        from app.tools import computer as _screen
+
+        self.registry.register(
+            "find_on_screen",
+            _screen.find_on_screen,
+            description=(
+                "Look for text on the screen. Lists every match with where "
+                "it is, so you can choose which one to click."
+            ),
+            parameters={
+                "text": {"type": "string"},
+            },
+        )
+
+        self.registry.register(
+            "click_match",
+            _screen.click_match,
+            description=(
+                "Click match number N from the last find_on_screen. "
+                "double=true double-clicks (e.g. to play a song)."
+            ),
+            parameters={
+                "number": {"type": "integer"},
+                "double": {"type": "boolean"},
+            },
+        )
+
+        self.registry.register(
+            "read_screen",
+            _screen.read_screen,
+            description=(
+                "Read the text currently visible on the screen, grouped "
+                "by area. Use it to check that an action worked."
+            ),
+            parameters={},
+        )
+
         self.brain.set_tool_registry(
             self.registry
         )
@@ -2471,6 +2509,13 @@ class JarvisRouter:
                     "what to click."
                 )
 
+            if str(position or "first").lower() == "first":
+
+                question = self._ambiguous_click_question(target)
+
+                if question:
+                    return question
+
             computer_action = {
                 "action":
                     "computer_click_target",
@@ -3089,10 +3134,72 @@ class JarvisRouter:
         memory = self.brain.memory
         mark = len(memory.messages)
 
+        url = str((arguments or {}).get("url", "")).lower()
+
+        # App links (spotify:..., ms-settings:...): report the real result,
+        # not the "I opened the website" wording.
+        if name == "open_url" and not url.startswith(("http://", "https://")):
+            return self.registry.execute(name, arguments)
+
         try:
-            return self.execute(name, arguments)
+            result = self.execute(name, arguments)
         finally:
             del memory.messages[mark:]
+
+        return self._summarize_for_model(name, arguments, result)
+
+    def _summarize_for_model(self, name, arguments, result):
+        """
+        Click tools return the whole before/after screen (hundreds of
+        OCR elements). The model only needs to know what happened,
+        and shorter results make its next call faster.
+        """
+
+        # Keystrokes and blind clicks have no visible result. Say so, so
+        # the model doesn't announce success it never saw.
+        if name in {"type_text", "press_key", "hotkey", "click_mouse"} and isinstance(result, str):
+            return (
+                result
+                + " (Not verified: I can't see the effect. Check with "
+                "read_screen before saying it worked.)"
+            )
+
+        if not (isinstance(result, dict) and "attempts" in result):
+            return result
+
+        arguments = arguments or {}
+
+        target = (
+            arguments.get("target")
+            or arguments.get("target_text")
+            or "it"
+        )
+
+        # What the click itself reported (last attempt that has one).
+        detail = None
+
+        for attempt in reversed(result.get("attempts") or []):
+
+            inner = attempt.get("result") if isinstance(attempt, dict) else None
+
+            if isinstance(inner, dict) and "result" in inner:
+                detail = inner["result"]
+                break
+
+        if isinstance(detail, dict) and detail.get("success") is False:
+            return "Failed: " + str(
+                detail.get("message", f"could not click {target}")
+            )
+
+        if isinstance(detail, str) and "could not find" in detail.lower():
+            return "Failed: " + detail
+
+        if result.get("success"):
+            return f"Clicked '{target}'. The screen changed."
+
+        return (
+            f"Clicked '{target}', but the screen did not visibly change."
+        )
 
     def _search_web_tool(self, query):
         """Open a Google search. Lets a small model just pass the query."""
@@ -3110,3 +3217,42 @@ class JarvisRouter:
         )
 
         return f"Searching Google for {query}."
+
+    def _ambiguous_click_question(self, target):
+        """
+        If the text to click appears in several places, ask which one
+        instead of clicking the first (top-left) hit.
+        Returns the question, or None when there is 0 or 1 match.
+        """
+
+        try:
+            # pyrefly: ignore [missing-import]
+            from app.tools.computer import describe_match, screen_matches
+
+            items = screen_matches(target)
+
+        except Exception:
+            return None            # fall back to the old behaviour
+
+        if len(items) < 2:
+            return None
+
+        options = "; ".join(
+            f"{item['id']}) {describe_match(item)}"
+            for item in items
+        )
+
+        question = (
+            f"I see '{target}' in {len(items)} places: {options}. "
+            "Which one should I click?"
+        )
+
+        # The regex path doesn't store anything, so remember this
+        # exchange for the user's answer ("the tab one", "number 2").
+        try:
+            self.brain.memory.add_user(f"click {target}")
+            self.brain.memory.add_assistant(question)
+        except Exception:
+            pass
+
+        return question

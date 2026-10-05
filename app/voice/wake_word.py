@@ -1,17 +1,8 @@
-import queue
-import sys
-
 import numpy as np
-import sounddevice as sd
 from openwakeword.model import Model
 
-
-SAMPLE_RATE = 16000
-CHANNELS = 1
-BLOCK_SIZE = 1280
-
-# Your microphone
-MICROPHONE_DEVICE = 1
+# pyrefly: ignore [missing-import]
+from app.voice.mic import MicStream
 
 # Built-in OpenWakeWord model
 WAKE_WORD = "hey_jarvis"
@@ -23,6 +14,7 @@ THRESHOLD = 0.5
 class WakeWordDetector:
 
     def __init__(self):
+
         print("Loading wake-word model...")
 
         self.model = Model(
@@ -30,78 +22,77 @@ class WakeWordDetector:
             vad_threshold=0
         )
 
-        self.audio_queue = queue.Queue()
-
         print("Wake-word model loaded.")
         print(f"Available models: {list(self.model.models.keys())}")
-        print(f"Listening for: {WAKE_WORD}")
 
-    def _audio_callback(self, indata, frames, time, status):
+    # ---------------------------------------------------------
+    def reset(self):
+        """Forget recent audio so Jarvis's own voice can't re-trigger."""
 
-        if status:
-            print(f"\nAudio status: {status}", file=sys.stderr)
+        try:
+            reset = getattr(self.model, "reset", None)
 
-        audio = indata[:, 0].copy()
+            if callable(reset):
+                reset()
 
-        self.audio_queue.put(audio)
+            buffers = getattr(self.model, "prediction_buffer", None)
 
-    def listen(self):
+            if isinstance(buffers, dict):
+                for buffer in buffers.values():
+                    buffer.clear()
 
-        print()
-        print("=" * 50)
-        print("JARVIS Wake Word Detector")
-        print("=" * 50)
-        print(f"Say: {WAKE_WORD}")
-        print("Listening...")
-        print("Press Ctrl+C to stop.")
-        print("=" * 50)
+        except Exception:
+            pass
 
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCK_SIZE,
-            device=MICROPHONE_DEVICE,
-            channels=CHANNELS,
-            dtype="int16",
-            callback=self._audio_callback,
-        ):
+    # ---------------------------------------------------------
+    def listen(self, mic=None):
+        """
+        Block until the wake word is heard.
 
+        Reads from the shared mic WITHOUT closing it, so the next
+        words ("...open Chrome") are still waiting in the buffer.
+        """
+
+        own = mic is None
+
+        if own:
+            mic = MicStream()
+            mic.start()
+
+        print(f"\nListening for '{WAKE_WORD.replace('_', ' ')}'... (Ctrl+C to stop)")
+
+        try:
             while True:
 
-                audio = self.audio_queue.get()
+                audio = mic.read(timeout=1.0)
 
-                audio = np.asarray(
-                    audio,
-                    dtype=np.int16
-                )
+                if audio is None:
+                    continue
+
+                audio = np.asarray(audio, dtype=np.int16)
 
                 prediction = self.model.predict(audio)
-
                 score = prediction.get(WAKE_WORD, 0.0)
 
                 if score >= THRESHOLD:
-
-                    print()
-                    print(
-                        f"Wake word detected! "
-                        f"score={score:.2f}"
-                    )
-
+                    print(f"Wake word detected! score={score:.2f}")
                     return True
+
+        finally:
+            if own:
+                mic.stop()
 
 
 if __name__ == "__main__":
 
     detector = WakeWordDetector()
 
-    try:
+    with MicStream() as mic:
 
-        while True:
-
-            detector.listen()
-
-            print("JARVIS: Yes?")
-
-    except KeyboardInterrupt:
-
-        print()
-        print("JARVIS wake-word detector stopped.")
+        try:
+            while True:
+                detector.listen(mic)
+                detector.reset()
+                print("JARVIS: Yes?")
+        except KeyboardInterrupt:
+            print("\nJARVIS wake-word detector stopped.")
